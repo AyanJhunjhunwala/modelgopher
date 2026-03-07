@@ -33,8 +33,8 @@ func fetchEvents() ([]Event, error) {
 }
 
 
-func searchEvents(query string) ([]Event, error) {
-	resp, err := http.Get(BaseURL + "/events?active=true&closed=false&limit=100&&tag_id=745")
+func searchEvents(query string) ([]Event, error) { // Team name for NBA no region
+	resp, err := http.Get(BaseURL + "/events?active=true&closed=false&limit=100")
 	if err != nil {
 		return nil, err
 	}
