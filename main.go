@@ -1,11 +1,27 @@
 package main
 
-import "log"
-
+import (
+    "bufio"
+    "fmt"
+    "log"
+    "os"
+    "strings"
+)
 func main() {
-	events, err := fetchEvents()
-	if err != nil {
-		log.Fatal(err)
-	}
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Search markets: ")
+	query, _ := reader.ReadString('\n')
+	query = strings.TrimSpace(query)
+
+    events, err := searchEvents(query)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+	if len(events) == 0 {
+        fmt.Println("No markets found.")
+        return
+    }
 	renderVolume(events)
 }
