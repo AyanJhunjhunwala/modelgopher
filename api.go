@@ -7,31 +7,19 @@ import (
 	"strings"
 )
 
+type Market struct {
+	Question      string  `json:"question"`
+	Outcomes      string  `json:"outcomes"`
+	OutcomePrices string  `json:"outcomePrices"`
+	Volume        float64 `json:"volumeNum"`
+}
+
 type Event struct {
-	Title     string  `json:"title"`
-	Volume24h float64 `json:"volume24hr"`
-	Liquidity float64 `json:"liquidity"`
+	Title     string   `json:"title"`
+	Volume24h float64  `json:"volume24hr"`
+	Liquidity float64  `json:"liquidity"`
+	Markets   []Market `json:"markets"`
 }
-
-func fetchEvents() ([]Event, error) {
-	resp, err := http.Get(BaseURL + "/events?active=true&closed=false&limit=10")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var events []Event
-	if err := json.Unmarshal(body, &events); err != nil {
-		return nil, err
-	}
-	return events, nil
-}
-
 
 func searchEvents(query string) ([]Event, error) { // Team name for NBA no region
 	resp, err := http.Get(BaseURL + "/events?active=true&closed=false&limit=100")
