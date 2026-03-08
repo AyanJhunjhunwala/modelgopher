@@ -17,10 +17,28 @@ type Market struct {
 }
 
 type Event struct {
+	ID        string   `json:"id"`
 	Title     string   `json:"title"`
 	Volume24h float64  `json:"volume24hr"`
 	Liquidity float64  `json:"liquidity"`
 	Markets   []Market `json:"markets"`
+}
+
+func fetchEvent(id string) (*Event, error) {
+	resp, err := http.Get(BaseURL + "/events/" + id)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var e Event
+	if err := json.Unmarshal(body, &e); err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 func fetchPage(offset int) ([]Event, error) {

@@ -21,6 +21,7 @@ const (
 
 type eventsMsg []Event
 type tickMsg time.Time
+type refreshMsg Event
 
 var (
 	styleTitle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
@@ -63,9 +64,19 @@ func fetchCmd(query string) tea.Cmd {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+func refreshCmd(id string) tea.Cmd {
+	return func() tea.Msg {
+		e, err := fetchEvent(id)
+		if err != nil || e == nil {
+			return nil
+		}
+		return refreshMsg(*e)
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -115,16 +126,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case refreshMsg:
+		ev := Event(msg)
+		m.selected = &ev
+		m.updated = time.Now()
+		return m, tickCmd()
+
 	case eventsMsg:
-		if m.state == stateView && m.selected != nil {
-			for _, e := range msg {
-				if e.Title == m.selected.Title {
-					ev := e
-					m.selected = &ev
-					m.updated = time.Now()
-					break
-				}
-			}
+		if m.state == stateView {
 			return m, tickCmd()
 		}
 		m.events = []Event(msg)
@@ -138,7 +147,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.state == stateView && m.selected != nil {
-			return m, fetchCmd(m.input.Value())
+			return m, refreshCmd(m.selected.ID)
 		}
 		return m, nil
 	}
