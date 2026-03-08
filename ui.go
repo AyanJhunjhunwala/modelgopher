@@ -23,22 +23,24 @@ type eventsMsg []Event
 type tickMsg time.Time
 
 var (
-	styleTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-	styleDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleCursor  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	styleYesBar  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // green
-	styleNoBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red
+	styleTitle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	styleCursor   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	styleYesBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	styleNoBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	styleYesLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	styleNoLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 )
 
 type model struct {
-	state    appState
-	input    textinput.Model
-	events   []Event
-	cursor   int
-	selected *Event
-	updated  time.Time
+	state        appState
+	input        textinput.Model
+	events       []Event
+	cursor       int
+	selected     *Event
+	updated      time.Time
+	scrollOffset int
+	height       int
 }
 
 func initialModel() model {
@@ -46,7 +48,7 @@ func initialModel() model {
 	ti.Placeholder = "e.g. Lakers, Trump, Bitcoin..."
 	ti.Focus()
 	ti.Width = 50
-	return model{state: stateSearch, input: ti}
+	return model{state: stateSearch, input: ti, height: 24}
 }
 
 func (m model) Init() tea.Cmd {
@@ -68,6 +70,10 @@ func tickCmd() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+		return m, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
@@ -76,6 +82,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateView {
 				m.state = stateList
 				m.selected = nil
+				m.scrollOffset = 0
 			} else if m.state == stateList {
 				m.state = stateSearch
 				m.events = nil
@@ -91,15 +98,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = &e
 				m.state = stateView
 				m.updated = time.Now()
+				m.scrollOffset = 0
 				return m, tickCmd()
 			}
 		case "up", "k":
 			if m.state == stateList && m.cursor > 0 {
 				m.cursor--
+			} else if m.state == stateView && m.scrollOffset > 0 {
+				m.scrollOffset--
 			}
 		case "down", "j":
 			if m.state == stateList && m.cursor < len(m.events)-1 {
 				m.cursor++
+			} else if m.state == stateView {
+				m.scrollOffset++
 			}
 		}
 
@@ -170,10 +182,12 @@ func (m model) View() string {
 			return ""
 		}
 		e := m.selected
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("\n  %s\n", styleTitle.Render(e.Title)))
-		sb.WriteString(fmt.Sprintf("  24h vol: $%-12.2f  liquidity: $%.2f\n", e.Volume24h, e.Liquidity))
-		sb.WriteString(fmt.Sprintf("  %s\n\n", styleDim.Render("updated "+m.updated.Format("15:04:05"))))
+		var lines []string
+		lines = append(lines, "")
+		lines = append(lines, "  "+styleTitle.Render(e.Title))
+		lines = append(lines, fmt.Sprintf("  24h vol: $%-12.2f  liquidity: $%.2f", e.Volume24h, e.Liquidity))
+		lines = append(lines, "  "+styleDim.Render("updated "+m.updated.Format("15:04:05")))
+		lines = append(lines, "")
 
 		for _, mkt := range e.Markets {
 			var outcomes []string
@@ -183,11 +197,9 @@ func (m model) View() string {
 			if len(outcomes) < 2 || len(prices) < 2 {
 				continue
 			}
-
 			if mkt.Question != "" {
-				sb.WriteString(fmt.Sprintf("  %s\n", styleDim.Render(mkt.Question)))
+				lines = append(lines, "  "+styleDim.Render(mkt.Question))
 			}
-
 			for i, outcome := range outcomes {
 				var price float64
 				fmt.Sscanf(prices[i], "%f", &price)
@@ -197,26 +209,44 @@ func (m model) View() string {
 				}
 				bar := strings.Repeat("█", barLen)
 				pct := fmt.Sprintf("%5.1f%%", price*100)
-
 				if i == 0 {
-					sb.WriteString(fmt.Sprintf("  %s %s  %s\n",
-						styleYesLabel.Render(fmt.Sprintf("%-4s", outcome)),
-						pct,
-						styleYesBar.Render(bar),
-					))
+					lines = append(lines, fmt.Sprintf("  %s %s  %s",
+						styleYesLabel.Render(fmt.Sprintf("%-4s", outcome)), pct, styleYesBar.Render(bar)))
 				} else {
-					sb.WriteString(fmt.Sprintf("  %s %s  %s\n",
-						styleNoLabel.Render(fmt.Sprintf("%-4s", outcome)),
-						pct,
-						styleNoBar.Render(bar),
-					))
+					lines = append(lines, fmt.Sprintf("  %s %s  %s",
+						styleNoLabel.Render(fmt.Sprintf("%-4s", outcome)), pct, styleNoBar.Render(bar)))
 				}
 			}
-			sb.WriteString(fmt.Sprintf("  %s\n\n", styleDim.Render(fmt.Sprintf("vol: $%.2f", mkt.Volume))))
+			lines = append(lines, "  "+styleDim.Render(fmt.Sprintf("vol: $%.2f", mkt.Volume)))
+			lines = append(lines, "")
 		}
 
-		sb.WriteString(fmt.Sprintf("  %s\n", styleDim.Render("esc back • ctrl+c quit")))
-		return sb.String()
+		// footer always visible — reserve 1 line
+		footer := "  " + styleDim.Render("↑/↓ scroll • esc back • ctrl+c quit")
+		viewHeight := m.height - 1
+
+		// clamp scroll
+		maxScroll := len(lines) - viewHeight
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.scrollOffset > maxScroll {
+			m.scrollOffset = maxScroll
+		}
+
+		end := m.scrollOffset + viewHeight
+		if end > len(lines) {
+			end = len(lines)
+		}
+		visible := lines[m.scrollOffset:end]
+
+		// scroll indicator
+		indicator := ""
+		if len(lines) > viewHeight {
+			indicator = styleDim.Render(fmt.Sprintf(" (%d/%d)", m.scrollOffset+viewHeight, len(lines)))
+		}
+
+		return strings.Join(visible, "\n") + "\n" + footer + indicator + "\n"
 	}
 	return ""
 }
