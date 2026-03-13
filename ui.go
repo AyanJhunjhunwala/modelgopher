@@ -36,8 +36,8 @@ var (
 	styleNoBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	styleYesLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	styleNoLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	styleBidBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))  // cyan — buy pressure
-	styleAskBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // orange — sell pressure
+	styleBidBar = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	styleAskBar = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 type model struct {
@@ -45,6 +45,7 @@ type model struct {
 	input        textinput.Model
 	events       []Event
 	cursor       int
+	listOffset   int // first visible row in the list
 	selected     *Event
 	orderBooks   map[string]OrderBook
 	updated      time.Time
@@ -71,6 +72,13 @@ func fetchCmd(query string) tea.Cmd {
 	}
 }
 
+func hotCmd() tea.Cmd {
+	return func() tea.Msg {
+		events, _ := fetchHotMarkets()
+		return eventsMsg(events)
+	}
+}
+
 func tickCmd() tea.Cmd {
 	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -88,6 +96,28 @@ func refreshCmd(id string) tea.Cmd {
 	}
 }
 
+// listViewHeight returns the number of rows available for list items.
+func (m model) listViewHeight() int {
+	// header (2) + footer (2) = 4 reserved lines
+	h := m.height - 4
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+// clampListOffset keeps the cursor visible in the list viewport.
+func (m *model) clampListOffset() {
+	vh := m.listViewHeight()
+	if m.cursor < m.listOffset {
+		m.listOffset = m.cursor
+	}
+	if m.cursor >= m.listOffset+vh {
+		m.listOffset = m.cursor - vh + 1
+	}
+	m.listOffset = max(m.listOffset, 0)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -98,6 +128,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+
+		case "tab":
+			if m.state == stateSearch {
+				return m, hotCmd()
+			}
+
 		case "esc":
 			if m.state == stateView {
 				m.state = stateList
@@ -108,8 +144,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateSearch
 				m.events = nil
 				m.cursor = 0
+				m.listOffset = 0
 			}
 			return m, nil
+
 		case "enter":
 			if m.state == stateSearch {
 				return m, fetchCmd(m.input.Value())
@@ -122,15 +160,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollOffset = 0
 				return m, refreshCmd(e.ID)
 			}
+
 		case "up", "k":
 			if m.state == stateList && m.cursor > 0 {
 				m.cursor--
+				m.clampListOffset()
 			} else if m.state == stateView && m.scrollOffset > 0 {
 				m.scrollOffset--
 			}
+
 		case "down", "j":
 			if m.state == stateList && m.cursor < len(m.events)-1 {
 				m.cursor++
+				m.clampListOffset()
 			} else if m.state == stateView {
 				m.scrollOffset++
 			}
@@ -147,11 +189,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd()
 		}
 		m.events = []Event(msg)
+		m.cursor = 0
+		m.listOffset = 0
 		if len(m.events) == 0 {
 			m.state = stateSearch
 		} else {
 			m.state = stateList
-			m.cursor = 0
 		}
 		return m, nil
 
@@ -197,7 +240,7 @@ func (m model) View() string {
 			"\n  %s\n\n  %s\n\n  %s\n",
 			styleTitle.Render("Polymarket CLI"),
 			m.input.View(),
-			styleDim.Render("enter to search • ctrl+c to quit"),
+			styleDim.Render("enter to search • tab for hot markets • ctrl+c to quit"),
 		)
 
 	case stateList:
@@ -209,14 +252,23 @@ func (m model) View() string {
 		}
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("\n  %s\n\n", styleTitle.Render("Select a market")))
-		for i, e := range m.events {
+
+		vh := m.listViewHeight()
+		end := min(m.listOffset+vh, len(m.events))
+		for i := m.listOffset; i < end; i++ {
+			e := m.events[i]
 			if i == m.cursor {
 				sb.WriteString(fmt.Sprintf("  %s %s\n", styleCursor.Render(">"), styleCursor.Render(e.Title)))
 			} else {
 				sb.WriteString(fmt.Sprintf("    %s\n", e.Title))
 			}
 		}
-		sb.WriteString(fmt.Sprintf("\n  %s\n", styleDim.Render("↑/↓ navigate • enter select • esc back")))
+
+		scrollInfo := ""
+		if len(m.events) > vh {
+			scrollInfo = styleDim.Render(fmt.Sprintf(" (%d/%d)", m.cursor+1, len(m.events)))
+		}
+		fmt.Fprintf(&sb, "\n  %s%s\n", styleDim.Render("↑/↓ navigate • enter select • esc back"), scrollInfo)
 		return sb.String()
 
 	case stateView:
@@ -246,7 +298,6 @@ func (m model) View() string {
 				lines = append(lines, "  "+styleDim.Render(mkt.Question))
 			}
 
-			// price bars (yes/no probability)
 			for i, outcome := range outcomes {
 				var price float64
 				fmt.Sscanf(prices[i], "%f", &price)
@@ -265,7 +316,6 @@ func (m model) View() string {
 				}
 			}
 
-			// order book depth (bids vs asks) for the Yes token
 			if len(tokenIDs) > 0 && m.orderBooks != nil {
 				if ob, ok := m.orderBooks[tokenIDs[0]]; ok {
 					bidTotal := sumSizes(ob.Bids)
@@ -290,10 +340,7 @@ func (m model) View() string {
 		footer := "  " + styleDim.Render("↑/↓ scroll • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
 
-		maxScroll := len(lines) - viewHeight
-		if maxScroll < 0 {
-			maxScroll = 0
-		}
+		maxScroll := max(len(lines)-viewHeight, 0)
 		if m.scrollOffset > maxScroll {
 			m.scrollOffset = maxScroll
 		}

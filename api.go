@@ -108,6 +108,23 @@ func fetchOrderBooks(e *Event) map[string]OrderBook {
 	return books
 }
 
+func fetchHotMarkets() ([]Event, error) {
+	resp, err := http.Get(BaseURL + "/events?active=true&closed=false&limit=20&order=volume24hr&ascending=false")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var events []Event
+	if err := json.Unmarshal(body, &events); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
 func fetchPage(offset int) ([]Event, error) {
 	url := BaseURL + fmt.Sprintf("/events?active=true&closed=false&limit=500&offset=%d", offset)
 	resp, err := http.Get(url)
