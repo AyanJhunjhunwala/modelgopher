@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +22,11 @@ const (
 
 type eventsMsg []Event
 type tickMsg time.Time
-type refreshMsg Event
+
+type refreshMsg struct {
+	event      Event
+	orderBooks map[string]OrderBook
+}
 
 var (
 	styleTitle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
@@ -31,6 +36,8 @@ var (
 	styleNoBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	styleYesLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	styleNoLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	styleBidBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))  // cyan — buy pressure
+	styleAskBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // orange — sell pressure
 )
 
 type model struct {
@@ -39,6 +46,7 @@ type model struct {
 	events       []Event
 	cursor       int
 	selected     *Event
+	orderBooks   map[string]OrderBook
 	updated      time.Time
 	scrollOffset int
 	height       int
@@ -75,7 +83,8 @@ func refreshCmd(id string) tea.Cmd {
 		if err != nil || e == nil {
 			return nil
 		}
-		return refreshMsg(*e)
+		books := fetchOrderBooks(e)
+		return refreshMsg{event: *e, orderBooks: books}
 	}
 }
 
@@ -93,6 +102,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateView {
 				m.state = stateList
 				m.selected = nil
+				m.orderBooks = nil
 				m.scrollOffset = 0
 			} else if m.state == stateList {
 				m.state = stateSearch
@@ -110,7 +120,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateView
 				m.updated = time.Now()
 				m.scrollOffset = 0
-				return m, tickCmd()
+				return m, refreshCmd(e.ID)
 			}
 		case "up", "k":
 			if m.state == stateList && m.cursor > 0 {
@@ -127,8 +137,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case refreshMsg:
-		ev := Event(msg)
-		m.selected = &ev
+		m.selected = &msg.event
+		m.orderBooks = msg.orderBooks
 		m.updated = time.Now()
 		return m, tickCmd()
 
@@ -155,6 +165,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func sumSizes(entries []OrderEntry) float64 {
+	var total float64
+	for _, e := range entries {
+		v, _ := strconv.ParseFloat(e.Size, 64)
+		total += v
+	}
+	return total
+}
+
+func depthBar(value, max float64, width int, style lipgloss.Style) string {
+	if max == 0 {
+		return ""
+	}
+	barLen := int((value / max) * float64(width))
+	if barLen < 0 {
+		barLen = 0
+	}
+	if barLen > width {
+		barLen = width
+	}
+	return style.Render(strings.Repeat("█", barLen))
 }
 
 func (m model) View() string {
@@ -201,14 +234,19 @@ func (m model) View() string {
 		for _, mkt := range e.Markets {
 			var outcomes []string
 			var prices []string
+			var tokenIDs []string
 			json.Unmarshal([]byte(mkt.Outcomes), &outcomes)
 			json.Unmarshal([]byte(mkt.OutcomePrices), &prices)
+			json.Unmarshal([]byte(mkt.ClobTokenIds), &tokenIDs)
 			if len(outcomes) < 2 || len(prices) < 2 {
 				continue
 			}
+
 			if mkt.Question != "" {
 				lines = append(lines, "  "+styleDim.Render(mkt.Question))
 			}
+
+			// price bars (yes/no probability)
 			for i, outcome := range outcomes {
 				var price float64
 				fmt.Sscanf(prices[i], "%f", &price)
@@ -226,15 +264,32 @@ func (m model) View() string {
 						styleNoLabel.Render(fmt.Sprintf("%-4s", outcome)), pct, styleNoBar.Render(bar)))
 				}
 			}
+
+			// order book depth (bids vs asks) for the Yes token
+			if len(tokenIDs) > 0 && m.orderBooks != nil {
+				if ob, ok := m.orderBooks[tokenIDs[0]]; ok {
+					bidTotal := sumSizes(ob.Bids)
+					askTotal := sumSizes(ob.Asks)
+					maxDepth := bidTotal
+					if askTotal > maxDepth {
+						maxDepth = askTotal
+					}
+					lines = append(lines, fmt.Sprintf("  %s $%-10.0f  %s",
+						styleBidBar.Render("BID"), bidTotal,
+						depthBar(bidTotal, maxDepth, 30, styleBidBar)))
+					lines = append(lines, fmt.Sprintf("  %s $%-10.0f  %s",
+						styleAskBar.Render("ASK"), askTotal,
+						depthBar(askTotal, maxDepth, 30, styleAskBar)))
+				}
+			}
+
 			lines = append(lines, "  "+styleDim.Render(fmt.Sprintf("vol: $%.2f", mkt.Volume)))
 			lines = append(lines, "")
 		}
 
-		// footer always visible — reserve 1 line
 		footer := "  " + styleDim.Render("↑/↓ scroll • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
 
-		// clamp scroll
 		maxScroll := len(lines) - viewHeight
 		if maxScroll < 0 {
 			maxScroll = 0
@@ -249,7 +304,6 @@ func (m model) View() string {
 		}
 		visible := lines[m.scrollOffset:end]
 
-		// scroll indicator
 		indicator := ""
 		if len(lines) > viewHeight {
 			indicator = styleDim.Render(fmt.Sprintf(" (%d/%d)", m.scrollOffset+viewHeight, len(lines)))
