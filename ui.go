@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,24 +23,21 @@ const (
 )
 
 type eventsMsg []Event
-type tickMsg time.Time
 type balanceMsg string
 
-type refreshMsg struct {
-	event      Event
-	orderBooks map[string]OrderBook
-}
+type refreshMsg struct{ event Event }
 
 var (
-	styleTitle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleCursor   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	styleYesBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	styleNoBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	styleYesLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	styleNoLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	styleBidBar = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
-	styleAskBar = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleTitle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	styleCursor    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	styleYesBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	styleNoBar     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleYesLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	styleNoLabel   = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	styleBidBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	styleAskBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleBotOn     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
 )
 
 type model struct {
@@ -45,7 +45,7 @@ type model struct {
 	input        textinput.Model
 	events       []Event
 	cursor       int
-	listOffset   int // first visible row in the list
+	listOffset   int
 	selected     *Event
 	orderBooks   map[string]OrderBook
 	updated      time.Time
@@ -53,6 +53,8 @@ type model struct {
 	height       int
 	width        int
 	balance      string
+	ws           *wsClient
+	scalpers     map[string]*os.Process // market slug → running scalper process
 }
 
 func initialModel() model {
@@ -60,7 +62,12 @@ func initialModel() model {
 	ti.Placeholder = "e.g. Lakers, Trump, Bitcoin..."
 	ti.Focus()
 	ti.Width = 50
-	return model{state: stateSearch, input: ti, height: 24}
+	return model{
+		state:    stateSearch,
+		input:    ti,
+		height:   24,
+		scalpers: make(map[string]*os.Process),
+	}
 }
 
 func balanceCmd() tea.Cmd {
@@ -88,26 +95,53 @@ func hotCmd() tea.Cmd {
 	}
 }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
-}
-
 func refreshCmd(id string) tea.Cmd {
 	return func() tea.Msg {
 		e, err := fetchEvent(id)
 		if err != nil || e == nil {
 			return nil
 		}
-		books := fetchOrderBooks(e)
-		return refreshMsg{event: *e, orderBooks: books}
+		return refreshMsg{event: *e}
 	}
+}
+
+// scalperBinPath finds the scalper binary by checking several locations.
+func scalperBinPath() string {
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		// absolute project path (most reliable)
+		filepath.Join(home, "Desktop", "Code", "modelgopher", "scalper", "scalper_bin"),
+		// relative to cwd (when running the built binary)
+		"../scalper/scalper_bin",
+		"./scalper/scalper_bin",
+	}
+	for _, p := range candidates {
+		if abs, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return abs
+			}
+		}
+	}
+	return candidates[0] // fall back to absolute even if not yet built
+}
+
+// launchScalper opens a new Terminal window running the scalper for slug.
+func launchScalper(slug string) (*os.Process, error) {
+	bin := scalperBinPath()
+	dir := filepath.Dir(bin)
+	script := fmt.Sprintf(
+		`tell application "Terminal" to do script "cd '%s' && ./scalper_bin '%s'"`,
+		dir, slug,
+	)
+	cmd := exec.Command("osascript", "-e", script)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd.Process, nil
 }
 
 // listViewHeight returns the number of rows available for list items.
 func (m model) listViewHeight() int {
-	// header (2) + footer (2) = 4 reserved lines
 	h := m.height - 4
 	if h < 1 {
 		h = 1
@@ -137,6 +171,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
+			m.ws.close()
+			for _, p := range m.scalpers {
+				p.Kill()
+			}
 			return m, tea.Quit
 
 		case "tab":
@@ -146,6 +184,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "esc":
 			if m.state == stateView {
+				m.ws.close()
+				m.ws = nil
 				m.state = stateList
 				m.selected = nil
 				m.orderBooks = nil
@@ -155,6 +195,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.events = nil
 				m.cursor = 0
 				m.listOffset = 0
+			}
+			return m, nil
+
+		case "s":
+			if m.state == stateView && m.selected != nil {
+				slug := m.selected.ID
+				if proc, ok := m.scalpers[slug]; ok {
+					proc.Kill()
+					delete(m.scalpers, slug)
+				} else {
+					if proc, err := launchScalper(slug); err == nil {
+						m.scalpers[slug] = proc
+					}
+				}
 			}
 			return m, nil
 
@@ -168,6 +222,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateView
 				m.updated = time.Now()
 				m.scrollOffset = 0
+				m.ws.close()
+				m.ws = nil
 				return m, refreshCmd(e.ID)
 			}
 
@@ -190,14 +246,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshMsg:
 		m.selected = &msg.event
-		m.orderBooks = msg.orderBooks
 		m.updated = time.Now()
-		return m, tickCmd()
+		return m, wsConnectCmd(msg.event.ID)
+
+	case wsConnectedMsg:
+		m.ws = msg.client
+		return m, wsWaitCmd(m.ws)
+
+	case wsBookMsg:
+		if m.orderBooks == nil {
+			m.orderBooks = make(map[string]OrderBook)
+		}
+		m.orderBooks[msg.slug] = msg.ob
+		m.updated = time.Now()
+		return m, wsWaitCmd(m.ws)
+
+	case wsErrMsg:
+		m.ws = nil
+		if m.state == stateView && m.selected != nil {
+			return m, wsConnectCmd(m.selected.ID)
+		}
+		return m, nil
 
 	case eventsMsg:
-		if m.state == stateView {
-			return m, tickCmd()
-		}
 		m.events = []Event(msg)
 		m.cursor = 0
 		m.listOffset = 0
@@ -211,12 +282,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case balanceMsg:
 		m.balance = string(msg)
 		return m, nil
-
-	case tickMsg:
-		if m.state == stateView && m.selected != nil {
-			return m, refreshCmd(m.selected.ID)
-		}
-		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -224,7 +289,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// topN returns at most n order book entries (API returns best-first).
+// topN returns at most n order book entries.
 func topN(entries []OrderEntry, n int) []OrderEntry {
 	if len(entries) <= n {
 		return entries
@@ -232,40 +297,40 @@ func topN(entries []OrderEntry, n int) []OrderEntry {
 	return entries[:n]
 }
 
-func sumSizes(entries []OrderEntry) float64 {
-	var total float64
-	for _, e := range entries {
-		v, _ := strconv.ParseFloat(e.Size, 64)
-		total += v
-	}
-	return total
-}
-
-// headerLine right-aligns the balance badge against the window width.
+// headerLine right-aligns badges (balance, bot status) against window width.
 func (m model) headerLine(left string) string {
-	if m.balance == "" || m.width == 0 {
+	var badges []string
+	if m.state == stateView && m.selected != nil {
+		if _, ok := m.scalpers[m.selected.ID]; ok {
+			badges = append(badges, styleBotOn.Render("[BOT ON]"))
+		}
+	}
+	if m.balance != "" {
+		badges = append(badges, styleDim.Render("$"+m.balance))
+	}
+	if len(badges) == 0 || m.width == 0 {
 		return left
 	}
-	badge := styleDim.Render("$" + m.balance)
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(badge) - 2
+	right := strings.Join(badges, "  ")
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 1 {
 		gap = 1
 	}
-	return left + strings.Repeat(" ", gap) + badge
+	return left + strings.Repeat(" ", gap) + right
 }
 
-func depthBar(value, max float64, width int, style lipgloss.Style) string {
-	if max == 0 {
+func depthBar(value, maxVal float64, width int, style lipgloss.Style) string {
+	if maxVal == 0 {
 		return ""
 	}
-	barLen := int((value / max) * float64(width))
-	if barLen < 0 {
-		barLen = 0
+	n := int((value / maxVal) * float64(width))
+	if n < 0 {
+		n = 0
 	}
-	if barLen > width {
-		barLen = width
+	if n > width {
+		n = width
 	}
-	return style.Render(strings.Repeat("█", barLen))
+	return style.Render(strings.Repeat("█", n))
 }
 
 func (m model) View() string {
@@ -287,18 +352,21 @@ func (m model) View() string {
 		}
 		var sb strings.Builder
 		sb.WriteString("\n" + m.headerLine("  "+styleTitle.Render("Markets")) + "\n\n")
-
 		vh := m.listViewHeight()
 		end := min(m.listOffset+vh, len(m.events))
 		for i := m.listOffset; i < end; i++ {
 			e := m.events[i]
+			botTag := ""
+			if _, ok := m.scalpers[e.ID]; ok {
+				botTag = " " + styleBotOn.Render("●")
+			}
 			if i == m.cursor {
-				sb.WriteString(fmt.Sprintf("  %s %s\n", styleCursor.Render(">"), styleCursor.Render(e.Title)))
+				sb.WriteString(fmt.Sprintf("  %s %s%s\n",
+					styleCursor.Render(">"), styleCursor.Render(e.Title), botTag))
 			} else {
-				sb.WriteString(fmt.Sprintf("    %s\n", e.Title))
+				sb.WriteString(fmt.Sprintf("    %s%s\n", e.Title, botTag))
 			}
 		}
-
 		scrollInfo := ""
 		if len(m.events) > vh {
 			scrollInfo = styleDim.Render(fmt.Sprintf(" (%d/%d)", m.cursor+1, len(m.events)))
@@ -322,9 +390,6 @@ func (m model) View() string {
 				lines = append(lines, "  "+styleDim.Render(mkt.Question))
 			}
 
-			// Separate long (YES) and short (NO) sides.
-			// long=true sides always carry a proper 0–1 probability.
-			// long=false sides store decimal odds, not probabilities.
 			var yesSides, noSides []MarketSide
 			for _, s := range mkt.MarketSides {
 				if s.Long {
@@ -334,8 +399,6 @@ func (m model) View() string {
 				}
 			}
 
-			// Build display items: for a binary market (1 YES + 1 NO) show both.
-			// For multi-outcome markets show all YES sides.
 			type displayItem struct {
 				name  string
 				price float64
@@ -367,7 +430,7 @@ func (m model) View() string {
 				}
 				bar := strings.Repeat("█", barLen)
 				pct := fmt.Sprintf("%5.1f%%", item.price*100)
-				label := fmt.Sprintf("%-6s", item.name)
+				label := fmt.Sprintf("%-12s", item.name)
 				if len(label) > 12 {
 					label = item.name[:12]
 				}
@@ -383,10 +446,9 @@ func (m model) View() string {
 			if mkt.Slug != "" && m.orderBooks != nil {
 				if ob, ok := m.orderBooks[mkt.Slug]; ok {
 					const bookLevels = 7
-					bids := topN(ob.Bids, bookLevels) // descending: best bid first
-					asks := topN(ob.Asks, bookLevels) // ascending:  best ask first
+					bids := topN(ob.Bids, bookLevels)
+					asks := topN(ob.Asks, bookLevels)
 
-					// Compute max qty across all visible levels for bar scaling.
 					maxQty := 0.0
 					for _, e := range append(bids, asks...) {
 						q, _ := strconv.ParseFloat(e.Size, 64)
@@ -395,7 +457,6 @@ func (m model) View() string {
 						}
 					}
 
-					// Asks: display reversed so the best ask is closest to the spread.
 					lines = append(lines, "  "+styleDim.Render("┌── asks ───────────────────────"))
 					for i := len(asks) - 1; i >= 0; i-- {
 						e := asks[i]
@@ -406,7 +467,6 @@ func (m model) View() string {
 							depthBar(qty, maxQty, 22, styleAskBar)))
 					}
 
-					// Spread line.
 					if len(bids) > 0 && len(asks) > 0 {
 						bestBid, _ := strconv.ParseFloat(bids[0].Price, 64)
 						bestAsk, _ := strconv.ParseFloat(asks[0].Price, 64)
@@ -415,7 +475,6 @@ func (m model) View() string {
 							styleDim.Render(fmt.Sprintf("├── spread %-6.4f ────────────────", spread))))
 					}
 
-					// Bids: best bid (highest price) at top, descending.
 					for _, e := range bids {
 						qty, _ := strconv.ParseFloat(e.Size, 64)
 						lines = append(lines, fmt.Sprintf("  %s  %s  %s",
@@ -430,25 +489,21 @@ func (m model) View() string {
 			lines = append(lines, "")
 		}
 
-		footer := "  " + styleDim.Render("↑/↓ scroll • esc back • ctrl+c quit")
+		footer := "  " + styleDim.Render("↑/↓ scroll • s scalper • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
-
 		maxScroll := max(len(lines)-viewHeight, 0)
 		if m.scrollOffset > maxScroll {
 			m.scrollOffset = maxScroll
 		}
-
 		end := m.scrollOffset + viewHeight
 		if end > len(lines) {
 			end = len(lines)
 		}
 		visible := lines[m.scrollOffset:end]
-
 		indicator := ""
 		if len(lines) > viewHeight {
 			indicator = styleDim.Render(fmt.Sprintf(" (%d/%d)", m.scrollOffset+viewHeight, len(lines)))
 		}
-
 		return strings.Join(visible, "\n") + "\n" + footer + indicator + "\n"
 	}
 	return ""
