@@ -1,1 +1,4 @@
 .env
+*_bin
+modelgopher/modelgopher
+modelgopher/scalper/scalper
