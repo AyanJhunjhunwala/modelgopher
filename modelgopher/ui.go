@@ -128,6 +128,7 @@ func binPath(relDir, name string) string {
 
 func scalperBinPath() string { return binPath("scalper", "scalper_bin") }
 func greedyBinPath() string  { return binPath("greedy", "greedy_bin") }
+func manualBinPath() string  { return binPath("manual", "manual_bin") }
 
 // launchBin opens a new Terminal window running bin with slug as argument.
 func launchBin(bin, slug string) (*os.Process, error) {
@@ -146,6 +147,7 @@ func launchBin(bin, slug string) (*os.Process, error) {
 
 func launchScalper(slug string) (*os.Process, error) { return launchBin(scalperBinPath(), slug) }
 func launchGreedy(slug string) (*os.Process, error)  { return launchBin(greedyBinPath(), slug) }
+func launchManual(slug string) (*os.Process, error)  { return launchBin(manualBinPath(), slug) }
 
 // listViewHeight returns the number of rows available for list items.
 func (m model) listViewHeight() int {
@@ -230,6 +232,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				delete(m.scalpers, slug)
 			} else {
 				if proc, err := launchGreedy(m.selected.ID); err == nil {
+					m.scalpers[slug] = proc
+				}
+			}
+			return m, nil
+
+		case "m":
+			if m.state != stateView || m.selected == nil {
+				break
+			}
+			slug := m.selected.ID + ":manual"
+			if proc, ok := m.scalpers[slug]; ok {
+				proc.Kill()
+				delete(m.scalpers, slug)
+			} else {
+				if proc, err := launchManual(m.selected.ID); err == nil {
 					m.scalpers[slug] = proc
 				}
 			}
@@ -329,6 +346,9 @@ func (m model) headerLine(left string) string {
 		}
 		if _, ok := m.scalpers[m.selected.ID+":greedy"]; ok {
 			badges = append(badges, styleBotOn.Render("[GREEDY]"))
+		}
+		if _, ok := m.scalpers[m.selected.ID+":manual"]; ok {
+			badges = append(badges, styleBotOn.Render("[MANUAL]"))
 		}
 	}
 	if m.balance != "" {
@@ -515,7 +535,7 @@ func (m model) View() string {
 			lines = append(lines, "")
 		}
 
-		footer := "  " + styleDim.Render("↑/↓ scroll • s scalper • g greedy • esc back • ctrl+c quit")
+		footer := "  " + styleDim.Render("↑/↓ scroll • s scalper • g greedy • m manual • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
 		maxScroll := max(len(lines)-viewHeight, 0)
 		if m.scrollOffset > maxScroll {

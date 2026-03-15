@@ -198,6 +198,81 @@ func fmin(a, b float64) float64 {
 	return b
 }
 
+// ── Open order types ──────────────────────────────────────────────────────────
+
+type nestedPrice struct {
+	Value string `json:"value"`
+}
+
+type openOrder struct {
+	ID       string      `json:"id"`
+	Intent   string      `json:"intent"`
+	Price    nestedPrice `json:"price"`
+	Quantity int         `json:"quantity"`
+}
+
+func apiGet(path string) ([]byte, error) {
+	req, _ := http.NewRequest("GET", accountURL+path, nil)
+	basePath, _, _ := strings.Cut(path, "?")
+	setAuth(req, "GET", basePath)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+// initSpent fetches existing open buy orders and seeds spentBits so the budget
+// cap is respected even after a restart with open positions.
+func initSpentFromAPI() {
+	raw, err := apiGet("/v1/orders/open?marketSlug=" + slug)
+	if err != nil {
+		log.Printf("[INIT] could not fetch open orders: %v", err)
+		return
+	}
+	if len(raw) == 0 || (raw[0] != '{' && raw[0] != '[') {
+		log.Printf("[INIT] unexpected open orders response: %s", raw)
+		return
+	}
+	var orders []openOrder
+	if raw[0] == '[' {
+		json.Unmarshal(raw, &orders)
+	} else {
+		var wrapped struct {
+			Orders []openOrder `json:"orders"`
+		}
+		if err := json.Unmarshal(raw, &wrapped); err == nil {
+			orders = wrapped.Orders
+		}
+	}
+	if len(orders) == 0 {
+		log.Printf("[INIT] no open positions in %s", slug)
+		return
+	}
+	var committed float64
+	for _, o := range orders {
+		if !strings.Contains(o.Intent, "BUY") {
+			continue
+		}
+		price, _ := strconv.ParseFloat(o.Price.Value, 64)
+		if price == 0 {
+			continue
+		}
+		cost := price * float64(o.Quantity)
+		committed += cost
+		log.Printf("[INIT]   order %s intent=%s qty=%d price=%.4f cost=$%.2f",
+			o.ID, o.Intent, o.Quantity, price, cost)
+	}
+	if committed > 0 {
+		addSpent(committed)
+		log.Printf("[INIT] pre-existing commitment $%.2f — available $%.2f of $%.2f budget",
+			committed, budget-loadSpent(), budget)
+	} else {
+		log.Printf("[INIT] no open buy positions — full $%.2f available", budget)
+	}
+}
+
 // ── Snipe logic ───────────────────────────────────────────────────────────────
 
 var buyInFlight atomic.Bool
@@ -338,7 +413,7 @@ func loadEnv(path string) {
 
 func main() {
 	flag.Float64Var(&budget, "budget", 50.0, "total USD budget")
-	flag.Float64Var(&discount, "discount", 0.03, "min gap below best bid to trigger snipe")
+	flag.Float64Var(&discount, "discount", 0.015, "min gap below best bid to trigger snipe")
 	flag.Float64Var(&maxPerTrade, "max-trade", 20.0, "max USD per single snipe")
 	flag.Parse()
 
@@ -359,5 +434,6 @@ func main() {
 		slug, budget, discount, maxPerTrade)
 
 	initAuth()
+	initSpentFromAPI()
 	run()
 }

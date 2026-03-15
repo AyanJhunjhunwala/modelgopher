@@ -140,15 +140,15 @@ type openOrder struct {
 	Status   string      `json:"status"`
 }
 
-// checkExistingPositions fetches open orders for the slug and sells any that
-// are already profitable at the current best bid.
+// checkExistingPositions fetches open orders for the slug, initialises
+// spentBits so the budget cap applies correctly from the very first tick,
+// and sells any filled positions that are already profitable.
 func checkExistingPositions(bestBid, _ float64) {
 	raw, err := apiGet("/v1/orders/open?marketSlug=" + slug)
 	if err != nil {
 		log.Printf("[INIT] could not fetch open orders: %v", err)
 		return
 	}
-	// Log raw for debugging if not valid JSON object
 	if len(raw) > 0 && raw[0] != '{' && raw[0] != '[' {
 		log.Printf("[INIT] open orders response: %s", raw)
 		return
@@ -156,7 +156,6 @@ func checkExistingPositions(bestBid, _ float64) {
 	var result struct {
 		Orders []openOrder `json:"orders"`
 	}
-	// API may return a top-level array instead of wrapped object
 	if len(raw) > 0 && raw[0] == '[' {
 		json.Unmarshal(raw, &result.Orders)
 	} else if err := json.Unmarshal(raw, &result); err != nil {
@@ -168,27 +167,53 @@ func checkExistingPositions(bestBid, _ float64) {
 		return
 	}
 	log.Printf("[INIT] found %d open order(s) in %s", len(result.Orders), slug)
+
+	// ── Step 1: reserve budget for every open buy order ──────────────────────
+	// We count the full order quantity (filled + pending) because both halves
+	// tie up real capital: filled = contracts we hold, pending = capital the
+	// exchange is holding for limit orders that haven't filled yet.
 	for _, o := range result.Orders {
-		filled := o.Filled
-		if filled == 0 {
-			log.Printf("[INIT]   order %s: unfilled — leaving on book", o.ID)
+		if !strings.Contains(o.Intent, "BUY") {
+			continue // sell orders don't consume budget
+		}
+		entryPrice, _ := strconv.ParseFloat(o.Price.Value, 64)
+		if entryPrice == 0 {
+			continue
+		}
+		committed := entryPrice * float64(o.Quantity)
+		addSpent(committed)
+		log.Printf("[INIT]   order %s intent=%s qty=%d filled=%d price=%.4f committed=$%.2f",
+			o.ID, o.Intent, o.Quantity, o.Filled, entryPrice, committed)
+	}
+	log.Printf("[INIT] pre-existing commitment $%.2f — available $%.2f of $%.2f budget",
+		loadSpent(), budget-loadSpent(), budget)
+
+	// ── Step 2: sell profitable filled positions ──────────────────────────────
+	for _, o := range result.Orders {
+		if !strings.Contains(o.Intent, "BUY") || o.Filled == 0 {
 			continue
 		}
 		entryPrice, _ := strconv.ParseFloat(o.Price.Value, 64)
-		profit := (bestBid - entryPrice) * float64(filled)
-		log.Printf("[INIT]   order %s: intent=%s price=%.4f filled=%d bid=%.4f profit=$%.4f",
-			o.ID, o.Intent, entryPrice, filled, bestBid, profit)
-		if profit >= minProfit*float64(filled) && entryPrice > 0 {
-			log.Printf("[INIT]   → selling %d contracts for +$%.4f", filled, profit)
+		if entryPrice == 0 {
+			continue
+		}
+		profit := (bestBid - entryPrice) * float64(o.Filled)
+		log.Printf("[INIT]   order %s: filled=%d bid=%.4f profit=$%.4f",
+			o.ID, o.Filled, bestBid, profit)
+		if profit >= minProfit*float64(o.Filled) {
 			sellIntent := "ORDER_INTENT_SELL_LONG"
 			if strings.Contains(o.Intent, "SHORT") {
 				sellIntent = "ORDER_INTENT_SELL_SHORT"
 			}
-			id, err := placeOrder(sellIntent, bestBid, filled)
+			log.Printf("[INIT]   → selling %d contracts for +$%.4f", o.Filled, profit)
+			id, err := placeOrder(sellIntent, bestBid, o.Filled)
 			if err != nil {
 				log.Printf("[INIT]   sell ERR: %v", err)
 			} else {
-				log.Printf("[INIT]   sell OK: order=%s", id)
+				// Return the full committed budget for this order now that it's closed.
+				addSpent(-(entryPrice * float64(o.Quantity)))
+				log.Printf("[INIT]   sell OK: order=%s  freed $%.2f  available $%.2f",
+					id, entryPrice*float64(o.Quantity), budget-loadSpent())
 			}
 		}
 	}
@@ -263,16 +288,19 @@ func parseBook(data []byte) (snap, bool) {
 // ── Position — lock-free ──────────────────────────────────────────────────────
 
 type position struct {
-	intent  string // ORDER_INTENT_BUY_LONG or ORDER_INTENT_BUY_SHORT
-	price   float64
-	qty     int
-	orderID string
+	intent      string // ORDER_INTENT_BUY_LONG or ORDER_INTENT_BUY_SHORT
+	price       float64
+	qty         int
+	orderID     string
+	sellOrderID string // non-empty if a GTC sell limit is already on the book
 }
 
-var posPtr       atomic.Pointer[position]
-var buyInFlight  atomic.Bool // true while an execBuy goroutine is running
-var totalBuys    atomic.Int64
-var totalSells   atomic.Int64
+var posPtr        atomic.Pointer[position]
+var buyInFlight   atomic.Bool // true while an execBuy goroutine is running
+var totalBuys     atomic.Int64
+var totalSells    atomic.Int64
+var forceSell     atomic.Bool  // set by stdin goroutine to trigger immediate sell
+var lastStatusNs  atomic.Int64 // nanoseconds of last status line print
 
 // atomic float64 spent tracker via unsafe bit cast
 var spentBits uint64
@@ -378,9 +406,70 @@ func onBook(s snap) {
 
 	pushMid(mid)
 
-	// One-time startup: check for existing profitable positions.
+	// ── Live status line (stdout, \r so it overwrites itself) ─────────────────
+	if p := posPtr.Load(); p != nil {
+		now := time.Now().UnixNano()
+		if now-lastStatusNs.Load() > 150_000_000 { // update every 150ms max
+			lastStatusNs.Store(now)
+			var pnl float64
+			side := "YES"
+			if p.intent == "ORDER_INTENT_BUY_LONG" {
+				pnl = (bestBid - p.price) * float64(p.qty)
+			} else {
+				side = "NO"
+				pnl = ((1.0 - bestAsk) - p.price) * float64(p.qty)
+			}
+			sign := "+"
+			if pnl < 0 {
+				sign = ""
+			}
+			fmt.Printf("\r\033[K  [LIVE] %s x%d @ %.4f  bid=%.4f ask=%.4f  P&L=%s$%.4f  [f+Enter=force sell]",
+				side, p.qty, p.price, bestBid, bestAsk, sign, pnl)
+		}
+	}
+
+	// ── Force sell triggered by user ──────────────────────────────────────────
+	if forceSell.CompareAndSwap(true, false) {
+		p := posPtr.Load()
+		if p == nil {
+			log.Printf("\n[FORCE SELL] no open position")
+			return
+		}
+		fmt.Println() // end the \r status line cleanly
+		var sellIntent string
+		var sellPrice float64
+		if p.intent == "ORDER_INTENT_BUY_LONG" {
+			sellIntent = "ORDER_INTENT_SELL_LONG"
+			sellPrice = bestBid
+		} else {
+			sellIntent = "ORDER_INTENT_SELL_SHORT"
+			sellPrice = bestAsk
+		}
+		// Cancel any queued GTC sell so we don't get a duplicate fill.
+		if p.sellOrderID != "" {
+			if sc, err := apiDelete("/v1/orders/" + p.sellOrderID); err != nil {
+				log.Printf("[CANCEL ERR] %v", err)
+			} else {
+				log.Printf("[CANCEL] GTC sell %s cancelled (status %d)", p.sellOrderID, sc)
+				p.sellOrderID = ""
+			}
+		}
+		log.Printf("[FORCE SELL] %s at %.4f", sellIntent, sellPrice)
+		go execSell(p, sellIntent, sellPrice)
+		return
+	}
+
+	// One-time startup: check for existing positions and seed spentBits.
+	// Hold buyInFlight true for the duration so no trade fires before the
+	// check finishes populating spentBits — otherwise the very next frame
+	// sees spentBits=0 and thinks the full budget is free.
 	if initDone.CompareAndSwap(false, true) {
-		go checkExistingPositions(bestBid, bestAsk)
+		buyInFlight.Store(true)
+		go func() {
+			checkExistingPositions(bestBid, bestAsk)
+			buyInFlight.Store(false)
+		}()
+		return
 	}
 
 	avail := budget - loadSpent()
@@ -394,11 +483,13 @@ func onBook(s snap) {
 	// ── Sell ─────────────────────────────────────────────────────────────────
 	if p := posPtr.Load(); p != nil {
 		if p.intent == "ORDER_INTENT_BUY_LONG" {
-			if bestBid >= p.price+minProfit {
+			// Sell when total P&L across all contracts >= minProfit
+			if (bestBid-p.price)*float64(p.qty) >= minProfit {
 				go execSell(p, "ORDER_INTENT_SELL_LONG", bestBid)
 			}
 		} else { // SHORT (long NO)
-			if bestAsk <= p.price-minProfit {
+			// Total P&L = improvement in NO value * qty
+			if ((1.0-bestAsk)-p.price)*float64(p.qty) >= minProfit {
 				go execSell(p, "ORDER_INTENT_SELL_SHORT", bestAsk)
 			}
 		}
@@ -431,12 +522,9 @@ func onBook(s snap) {
 
 	// Arb: cost of YES+NO < $1 guaranteed — bypass BB (pure math edge)
 	if bestAsk+(1.0-bestBid) < 0.99 {
-		qty := int(fmin(maxPerTrade, avail) / bestAsk)
-		if qty >= 1 {
-			log.Printf("[ARB ] combined=%.4f  YES ask=%.4f qty=%d BB=%s", bestAsk+(1-bestBid), bestAsk, qty, bbStr)
-			if buyInFlight.CompareAndSwap(false, true) {
-				go execBuy("ORDER_INTENT_BUY_LONG", bestAsk, qty)
-			}
+		log.Printf("[ARB ] combined=%.4f  YES ask=%.4f BB=%s", bestAsk+(1-bestBid), bestAsk, bbStr)
+		if buyInFlight.CompareAndSwap(false, true) {
+			go execBuy("ORDER_INTENT_BUY_LONG", bestAsk, bestAsk)
 		}
 		return
 	}
@@ -447,7 +535,6 @@ func onBook(s snap) {
 	}
 	bidDepth := depth(s.bids, 3)
 	askDepth := depth(s.asks, 3)
-	spend := fmin(maxPerTrade, avail)
 
 	if bidDepth > askDepth*1.5 {
 		// Long YES — skip if mid is above upper band (price stretched high)
@@ -455,13 +542,11 @@ func onBook(s snap) {
 			log.Printf("[SKIP] BB overbought mid=%.4f upper=%.4f", mid, bbUpper)
 			return
 		}
-		qty := int(spend / bestAsk)
-		if qty >= 1 {
-			log.Printf("[BUY ] YES ask=%.4f qty=%d spread=%.4f bid/ask=%.0f/%.0f BB=%s",
-				bestAsk, qty, spread, bidDepth, askDepth, bbStr)
-			if buyInFlight.CompareAndSwap(false, true) {
-				go execBuy("ORDER_INTENT_BUY_LONG", bestAsk, qty)
-			}
+		log.Printf("[BUY ] YES ask=%.4f spread=%.4f bid/ask=%.0f/%.0f BB=%s",
+			bestAsk, spread, bidDepth, askDepth, bbStr)
+		if buyInFlight.CompareAndSwap(false, true) {
+			// LONG: order price = YES ask, cost per contract = YES ask
+			go execBuy("ORDER_INTENT_BUY_LONG", bestAsk, bestAsk)
 		}
 	} else if askDepth > bidDepth*1.5 {
 		// Short YES (long NO) — skip if mid is below lower band (price stretched low)
@@ -470,13 +555,12 @@ func onBook(s snap) {
 			return
 		}
 		noPrice := 1.0 - bestAsk
-		qty := int(spend / noPrice)
-		if qty >= 1 {
-			log.Printf("[BUY ] NO  price=%.4f qty=%d spread=%.4f bid/ask=%.0f/%.0f BB=%s",
-				noPrice, qty, spread, bidDepth, askDepth, bbStr)
-			if buyInFlight.CompareAndSwap(false, true) {
-				go execBuy("ORDER_INTENT_BUY_SHORT", bestAsk, qty)
-			}
+		log.Printf("[BUY ] NO  price=%.4f spread=%.4f bid/ask=%.0f/%.0f BB=%s",
+			noPrice, spread, bidDepth, askDepth, bbStr)
+		if buyInFlight.CompareAndSwap(false, true) {
+			// SHORT: order price = YES ask (what the exchange sees),
+			// cost per contract = NO price (1 - YES ask) — what we actually pay.
+			go execBuy("ORDER_INTENT_BUY_SHORT", bestAsk, noPrice)
 		}
 	}
 }
@@ -498,44 +582,93 @@ func fetchLiveBalance() float64 {
 	return result.Balances[0].BuyingPower
 }
 
-func execBuy(intent string, price float64, _ int) {
+// execBuy places a limit buy order and updates the budget tracker.
+// orderPrice is the price sent to the API (always the YES ask for the exchange).
+// costPrice is the per-contract cost for budget tracking:
+//   - LONG: same as orderPrice (YES ask)
+//   - SHORT: 1 - orderPrice  (NO price, what you actually pay per contract)
+func execBuy(intent string, orderPrice, costPrice float64) {
 	defer buyInFlight.Store(false)
 
 	avail := budget - loadSpent()
 	spend := fmin(maxPerTrade, avail)
-	qty := int(spend / price)
+	qty := int(spend / costPrice)
 	if qty < 1 {
 		log.Printf("[SKIP] budget exhausted spent=$%.2f budget=$%.2f", loadSpent(), budget)
 		return
 	}
-	id, err := placeOrder(intent, price, qty)
+	cost := costPrice * float64(qty)
+	if loadSpent()+cost > budget+0.01 { // 1-cent tolerance for float rounding
+		log.Printf("[SKIP] would exceed budget: spent=%.2f + cost=%.2f > budget=%.2f",
+			loadSpent(), cost, budget)
+		return
+	}
+	id, err := placeOrder(intent, orderPrice, qty)
 	if err != nil {
 		log.Printf("[BUY ERR] %v", err)
 		return
 	}
-	p := &position{intent: intent, price: price, qty: qty, orderID: id}
+	p := &position{intent: intent, price: costPrice, qty: qty, orderID: id}
 	posPtr.Store(p)
-	addSpent(price * float64(qty))
+	addSpent(cost)
 	totalBuys.Add(1)
 	log.Printf("[BUY OK] %s  order=%s  qty=%d  cost=$%.2f  spent=$%.2f/%.2f  round=%d",
-		intent, id, qty, price*float64(qty), loadSpent(), budget, totalBuys.Load())
+		intent, id, qty, cost, loadSpent(), budget, totalBuys.Load())
+
+	// Immediately post a GTC sell limit at the minimum profit target.
+	// This sits on the exchange book and fills the instant someone crosses it —
+	// no need to wait for a WS tick to confirm price moved.
+	var sellIntent string
+	var sellPrice float64
+	// minProfit is total USD — convert to per-contract price delta.
+	perContract := minProfit / float64(qty)
+	if intent == "ORDER_INTENT_BUY_LONG" {
+		sellIntent = "ORDER_INTENT_SELL_LONG"
+		sellPrice = costPrice + perContract
+	} else {
+		// SHORT: YES ask must fall by perContract from original YES ask (1 - costPrice)
+		sellIntent = "ORDER_INTENT_SELL_SHORT"
+		sellPrice = (1.0 - costPrice) - perContract
+	}
+	sellID, sellErr := placeOrder(sellIntent, sellPrice, qty)
+	if sellErr != nil {
+		log.Printf("[SELL QUEUE ERR] %v — onBook monitor will retry", sellErr)
+	} else {
+		p.sellOrderID = sellID
+		log.Printf("[SELL QUEUED] %s @ %.4f  order=%s", sellIntent, sellPrice, sellID)
+	}
 }
 
 func execSell(p *position, intent string, price float64) {
 	if !posPtr.CompareAndSwap(p, nil) {
 		return // another goroutine beat us
 	}
-	id, err := placeOrder(intent, price, p.qty)
-	if err != nil {
-		log.Printf("[SELL ERR] %v — restoring", err)
-		posPtr.Store(p)
-		return
+	fmt.Println() // end the live \r status line before logging
+
+	var orderID string
+	if p.sellOrderID != "" {
+		// GTC sell already on the book from execBuy — price crossed, treat as filled.
+		orderID = p.sellOrderID
+		log.Printf("[SELL CONFIRM] GTC order %s filled at ~%.4f", orderID, price)
+	} else {
+		// Fallback: no queued sell, place one now.
+		id, err := placeOrder(intent, price, p.qty)
+		if err != nil {
+			log.Printf("[SELL ERR] %v — restoring", err)
+			posPtr.Store(p)
+			return
+		}
+		orderID = id
 	}
+
 	var profit float64
 	if strings.Contains(intent, "SELL_LONG") {
-		profit = (price - p.price) * float64(p.qty) // LONG: sold higher than bought
+		// p.price = YES costPrice; profit = price improvement per contract
+		profit = (price - p.price) * float64(p.qty)
 	} else {
-		profit = (p.price - price) * float64(p.qty) // SHORT: YES dropped, NO gained
+		// p.price = NO costPrice; price = current YES ask
+		// NO value at sell = 1 - price; profit per contract = (1-price) - p.price
+		profit = ((1.0 - price) - p.price) * float64(p.qty)
 	}
 	addSpent(-(p.price * float64(p.qty))) // return capital to budget tracker
 	totalSells.Add(1)
@@ -546,7 +679,7 @@ func execSell(p *position, intent string, price float64) {
 		coolMsg = fmt.Sprintf("cooldown %ds starting", cooldownSec)
 	}
 	log.Printf("[SELL OK] %s  order=%s  profit=$%.4f  buys=%d sells=%d  %s",
-		intent, id, profit, totalBuys.Load(), totalSells.Load(), coolMsg)
+		intent, orderID, profit, totalBuys.Load(), totalSells.Load(), coolMsg)
 }
 
 func depth(levels []level, n int) float64 {
@@ -643,8 +776,8 @@ func loadEnv(path string) {
 
 func main() {
 	// Flags
-	flag.Float64Var(&budget, "budget", 20.0, "total USD budget")
-	flag.Float64Var(&minProfit, "profit", 0.02, "min profit per contract to sell")
+	flag.Float64Var(&budget, "budget", 40.0, "total USD budget")
+	flag.Float64Var(&minProfit, "profit", 0.20, "min total profit in USD to trigger sell")
 	flag.Float64Var(&enterSpread, "spread", 0.02, "max spread to enter")
 	flag.Float64Var(&maxPerTrade, "max-trade", 20.0, "max USD per single entry")
 	flag.IntVar(&cooldownSec, "cooldown", 5, "seconds to wait after a sell before re-entry")
@@ -663,9 +796,22 @@ func main() {
 	loadEnv("../modelgopher/.env")
 	loadEnv(home + "/Desktop/Code/modelgopher/modelgopher/.env")
 
+	// Send logs to stderr so they don't clobber the \r live status line on stdout.
+	log.SetOutput(os.Stderr)
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	log.Printf("Scalper  market=%s  budget=$%.2f  profit≥$%.2f  spread≤%.2f  max/trade=$%.2f",
+	log.Printf("Scalper  market=%s  budget=$%.2f  profit≥$%.2f total  spread≤%.2f  max/trade=$%.2f",
 		slug, budget, minProfit, enterSpread, maxPerTrade)
+	fmt.Println("  Type 'f' + Enter at any time to force-sell the open position.")
+
+	// Goroutine: read stdin for 'f'+Enter → set forceSell flag.
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			if strings.TrimSpace(sc.Text()) == "f" {
+				forceSell.Store(true)
+			}
+		}
+	}()
 
 	initAuth()
 	run()
