@@ -273,14 +273,14 @@ func searchEvents(query string) ([]Event, error) {
 	var allEvents []Event
 	var mu sync.Mutex
 
-	for batchStart := 0; ; batchStart += 50 {
+	for batchStart := 0; ; batchStart += 100 {
 		type result struct {
 			page   int
 			events []Event
 		}
-		results := make([]result, 50)
+		results := make([]result, 100)
 		var wg sync.WaitGroup
-		for i := 0; i < 50; i++ {
+		for i := 0; i < 100; i++ {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()

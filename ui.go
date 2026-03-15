@@ -382,28 +382,48 @@ func (m model) View() string {
 
 			if mkt.Slug != "" && m.orderBooks != nil {
 				if ob, ok := m.orderBooks[mkt.Slug]; ok {
-					// Cap to top 5 levels to avoid far-from-market orders skewing depth
-					bidTop := topN(ob.Bids, 5)
-					askTop := topN(ob.Asks, 5)
-					bidTotal := sumSizes(bidTop)
-					askTotal := sumSizes(askTop)
-					maxDepth := bidTotal
-					if askTotal > maxDepth {
-						maxDepth = askTotal
+					const bookLevels = 7
+					bids := topN(ob.Bids, bookLevels) // descending: best bid first
+					asks := topN(ob.Asks, bookLevels) // ascending:  best ask first
+
+					// Compute max qty across all visible levels for bar scaling.
+					maxQty := 0.0
+					for _, e := range append(bids, asks...) {
+						q, _ := strconv.ParseFloat(e.Size, 64)
+						if q > maxQty {
+							maxQty = q
+						}
 					}
-					bestBid, bestAsk := "", ""
-					if len(ob.Bids) > 0 {
-						bestBid = "@" + ob.Bids[0].Price
+
+					// Asks: display reversed so the best ask is closest to the spread.
+					lines = append(lines, "  "+styleDim.Render("┌── asks ───────────────────────"))
+					for i := len(asks) - 1; i >= 0; i-- {
+						e := asks[i]
+						qty, _ := strconv.ParseFloat(e.Size, 64)
+						lines = append(lines, fmt.Sprintf("  %s  %s  %s",
+							styleAskBar.Render(fmt.Sprintf("%-7s", e.Price)),
+							styleDim.Render(fmt.Sprintf("$%-7.0f", qty)),
+							depthBar(qty, maxQty, 22, styleAskBar)))
 					}
-					if len(ob.Asks) > 0 {
-						bestAsk = "@" + ob.Asks[0].Price
+
+					// Spread line.
+					if len(bids) > 0 && len(asks) > 0 {
+						bestBid, _ := strconv.ParseFloat(bids[0].Price, 64)
+						bestAsk, _ := strconv.ParseFloat(asks[0].Price, 64)
+						spread := bestAsk - bestBid
+						lines = append(lines, fmt.Sprintf("  %s",
+							styleDim.Render(fmt.Sprintf("├── spread %-6.4f ────────────────", spread))))
 					}
-					lines = append(lines, fmt.Sprintf("  %s %-8s $%-8.0f  %s",
-						styleBidBar.Render("BID"), bestBid, bidTotal,
-						depthBar(bidTotal, maxDepth, 28, styleBidBar)))
-					lines = append(lines, fmt.Sprintf("  %s %-8s $%-8.0f  %s",
-						styleAskBar.Render("ASK"), bestAsk, askTotal,
-						depthBar(askTotal, maxDepth, 28, styleAskBar)))
+
+					// Bids: best bid (highest price) at top, descending.
+					for _, e := range bids {
+						qty, _ := strconv.ParseFloat(e.Size, 64)
+						lines = append(lines, fmt.Sprintf("  %s  %s  %s",
+							styleBidBar.Render(fmt.Sprintf("%-7s", e.Price)),
+							styleDim.Render(fmt.Sprintf("$%-7.0f", qty)),
+							depthBar(qty, maxQty, 22, styleBidBar)))
+					}
+					lines = append(lines, "  "+styleDim.Render("└── bids ───────────────────────"))
 				}
 			}
 
