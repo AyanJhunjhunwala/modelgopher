@@ -105,15 +105,13 @@ func refreshCmd(id string) tea.Cmd {
 	}
 }
 
-// scalperBinPath finds the scalper binary by checking several locations.
-func scalperBinPath() string {
+// binPath finds a binary by checking several locations relative to the project root.
+func binPath(relDir, name string) string {
 	home, _ := os.UserHomeDir()
 	candidates := []string{
-		// absolute project path (most reliable)
-		filepath.Join(home, "Desktop", "Code", "modelgopher", "scalper", "scalper_bin"),
-		// relative to cwd (when running the built binary)
-		"../scalper/scalper_bin",
-		"./scalper/scalper_bin",
+		filepath.Join(home, "Desktop", "Code", "modelgopher", relDir, name),
+		filepath.Join("..", relDir, name),
+		filepath.Join(".", relDir, name),
 	}
 	for _, p := range candidates {
 		if abs, err := filepath.Abs(p); err == nil {
@@ -122,16 +120,19 @@ func scalperBinPath() string {
 			}
 		}
 	}
-	return candidates[0] // fall back to absolute even if not yet built
+	return candidates[0]
 }
 
-// launchScalper opens a new Terminal window running the scalper for slug.
-func launchScalper(slug string) (*os.Process, error) {
-	bin := scalperBinPath()
+func scalperBinPath() string { return binPath("scalper", "scalper_bin") }
+func greedyBinPath() string  { return binPath("greedy", "greedy_bin") }
+
+// launchBin opens a new Terminal window running bin with slug as argument.
+func launchBin(bin, slug string) (*os.Process, error) {
 	dir := filepath.Dir(bin)
+	name := filepath.Base(bin)
 	script := fmt.Sprintf(
-		`tell application "Terminal" to do script "cd '%s' && ./scalper_bin '%s'"`,
-		dir, slug,
+		`tell application "Terminal" to do script "cd '%s' && ./%s '%s'"`,
+		dir, name, slug,
 	)
 	cmd := exec.Command("osascript", "-e", script)
 	if err := cmd.Start(); err != nil {
@@ -139,6 +140,9 @@ func launchScalper(slug string) (*os.Process, error) {
 	}
 	return cmd.Process, nil
 }
+
+func launchScalper(slug string) (*os.Process, error) { return launchBin(scalperBinPath(), slug) }
+func launchGreedy(slug string) (*os.Process, error)  { return launchBin(greedyBinPath(), slug) }
 
 // listViewHeight returns the number of rows available for list items.
 func (m model) listViewHeight() int {
@@ -199,15 +203,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "s":
-			if m.state == stateView && m.selected != nil {
-				slug := m.selected.ID
-				if proc, ok := m.scalpers[slug]; ok {
-					proc.Kill()
-					delete(m.scalpers, slug)
-				} else {
-					if proc, err := launchScalper(slug); err == nil {
-						m.scalpers[slug] = proc
-					}
+			if m.state != stateView || m.selected == nil {
+				break // let keystroke fall through to text input
+			}
+			slug := m.selected.ID
+			if proc, ok := m.scalpers[slug]; ok {
+				proc.Kill()
+				delete(m.scalpers, slug)
+			} else {
+				if proc, err := launchScalper(slug); err == nil {
+					m.scalpers[slug] = proc
+				}
+			}
+			return m, nil
+
+		case "g":
+			if m.state != stateView || m.selected == nil {
+				break
+			}
+			slug := m.selected.ID + ":greedy"
+			if proc, ok := m.scalpers[slug]; ok {
+				proc.Kill()
+				delete(m.scalpers, slug)
+			} else {
+				if proc, err := launchGreedy(m.selected.ID); err == nil {
+					m.scalpers[slug] = proc
 				}
 			}
 			return m, nil
@@ -302,7 +322,10 @@ func (m model) headerLine(left string) string {
 	var badges []string
 	if m.state == stateView && m.selected != nil {
 		if _, ok := m.scalpers[m.selected.ID]; ok {
-			badges = append(badges, styleBotOn.Render("[BOT ON]"))
+			badges = append(badges, styleBotOn.Render("[SCALPER]"))
+		}
+		if _, ok := m.scalpers[m.selected.ID+":greedy"]; ok {
+			badges = append(badges, styleBotOn.Render("[GREEDY]"))
 		}
 	}
 	if m.balance != "" {
@@ -489,7 +512,7 @@ func (m model) View() string {
 			lines = append(lines, "")
 		}
 
-		footer := "  " + styleDim.Render("↑/↓ scroll • s scalper • esc back • ctrl+c quit")
+		footer := "  " + styleDim.Render("↑/↓ scroll • s scalper • g greedy • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
 		maxScroll := max(len(lines)-viewHeight, 0)
 		if m.scrollOffset > maxScroll {
