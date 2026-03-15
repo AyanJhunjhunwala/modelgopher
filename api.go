@@ -1,32 +1,41 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-const ClobURL = "https://clob.polymarket.com"
-
 type OrderEntry struct {
-	Price string `json:"price"`
-	Size  string `json:"size"`
+	Price string
+	Size  string
 }
 
 type OrderBook struct {
-	Bids []OrderEntry `json:"bids"`
-	Asks []OrderEntry `json:"asks"`
+	Bids []OrderEntry
+	Asks []OrderEntry
+}
+
+type MarketSide struct {
+	Description string `json:"description"`
+	Price       string `json:"price"`
+	Long        bool   `json:"long"`
 }
 
 type Market struct {
-	Question      string  `json:"question"`
-	Outcomes      string  `json:"outcomes"`
-	OutcomePrices string  `json:"outcomePrices"`
-	Volume        float64 `json:"volumeNum"`
-	ClobTokenIds  string  `json:"clobTokenIds"`
+	ID          string       `json:"id"`
+	Question    string       `json:"question"`
+	Title       string       `json:"title"`
+	Slug        string       `json:"slug"`
+	MarketSides []MarketSide `json:"marketSides"`
 }
 
 type Event struct {
@@ -37,8 +46,79 @@ type Event struct {
 	Markets   []Market `json:"markets"`
 }
 
-func fetchEvent(id string) (*Event, error) {
-	resp, err := http.Get(BaseURL + "/events/" + id)
+// bookPx / bookEntry parse the new API's order book format.
+type bookPx struct {
+	Value string `json:"value"`
+}
+type bookEntry struct {
+	Px  bookPx `json:"px"`
+	Qty string  `json:"qty"`
+}
+
+// signRequest builds an Ed25519 signature for the given method+path.
+func signRequest(method, path string) (timestamp, sig string, err error) {
+	secret := os.Getenv("PM_SECRET")
+	if secret == "" {
+		return "", "", fmt.Errorf("PM_SECRET not set")
+	}
+	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	msg := ts + method + path
+	keyBytes, err := base64.StdEncoding.DecodeString(secret)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid PM_SECRET: %w", err)
+	}
+	if len(keyBytes) < 32 {
+		return "", "", fmt.Errorf("PM_SECRET too short")
+	}
+	privKey := ed25519.NewKeyFromSeed(keyBytes[:32])
+	sigBytes := ed25519.Sign(privKey, []byte(msg))
+	return ts, base64.StdEncoding.EncodeToString(sigBytes), nil
+}
+
+func addAuthHeaders(req *http.Request, method, path string) error {
+	ts, sig, err := signRequest(method, path)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-PM-Access-Key", os.Getenv("PM_KEY_ID"))
+	req.Header.Set("X-PM-Timestamp", ts)
+	req.Header.Set("X-PM-Signature", sig)
+	req.Header.Set("Accept", "application/json")
+	return nil
+}
+
+// marketsToEvents wraps a flat market list into single-market Event wrappers
+// so the existing UI model works unchanged.
+func marketTitle(m Market) string {
+	if m.Title != "" && m.Title != m.Question {
+		return m.Question + ": " + m.Title
+	}
+	if m.Question != "" {
+		return m.Question
+	}
+	return m.Title
+}
+
+func marketToEvent(m Market) Event {
+	return Event{
+		ID:      m.Slug,
+		Title:   marketTitle(m),
+		Markets: []Market{m},
+	}
+}
+
+// marketsToEvents wraps a flat market list into single-market Event wrappers
+// so the existing UI model works unchanged.
+func marketsToEvents(markets []Market) []Event {
+	events := make([]Event, len(markets))
+	for i, m := range markets {
+		events[i] = marketToEvent(m)
+	}
+	return events
+}
+
+func fetchEvent(slug string) (*Event, error) {
+	resp, err := http.Get(GatewayURL + "/v1/market/slug/" + slug)
 	if err != nil {
 		return nil, err
 	}
@@ -47,15 +127,19 @@ func fetchEvent(id string) (*Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	var e Event
-	if err := json.Unmarshal(body, &e); err != nil {
+	// response is {"market": {...}}
+	var wrapper struct {
+		Market Market `json:"market"`
+	}
+	if err := json.Unmarshal(body, &wrapper); err != nil {
 		return nil, err
 	}
+	e := marketToEvent(wrapper.Market)
 	return &e, nil
 }
 
-func fetchOrderBook(tokenID string) (*OrderBook, error) {
-	resp, err := http.Get(ClobURL + "/book?token_id=" + tokenID)
+func fetchOrderBook(slug string) (*OrderBook, error) {
+	resp, err := http.Get(GatewayURL + "/v1/markets/" + slug + "/book")
 	if err != nil {
 		return nil, err
 	}
@@ -64,34 +148,45 @@ func fetchOrderBook(tokenID string) (*OrderBook, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ob OrderBook
-	if err := json.Unmarshal(body, &ob); err != nil {
+	var raw struct {
+		MarketData struct {
+			Bids   []bookEntry `json:"bids"`
+			Offers []bookEntry `json:"offers"`
+		} `json:"marketData"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
-	return &ob, nil
+	ob := &OrderBook{}
+	for _, e := range raw.MarketData.Bids {
+		ob.Bids = append(ob.Bids, OrderEntry{Price: e.Px.Value, Size: e.Qty})
+	}
+	for _, e := range raw.MarketData.Offers {
+		ob.Asks = append(ob.Asks, OrderEntry{Price: e.Px.Value, Size: e.Qty})
+	}
+	return ob, nil
 }
 
-// fetchOrderBooks fetches all order books for an event's markets concurrently.
-// Returns a map of tokenID -> OrderBook.
+// fetchOrderBooks fetches order books for all markets in an event concurrently.
+// Returns a map of market slug → OrderBook.
 func fetchOrderBooks(e *Event) map[string]OrderBook {
 	type result struct {
-		tokenID string
-		ob      *OrderBook
+		slug string
+		ob   *OrderBook
 	}
 	var wg sync.WaitGroup
 	ch := make(chan result)
 
 	for _, mkt := range e.Markets {
-		var tokenIDs []string
-		json.Unmarshal([]byte(mkt.ClobTokenIds), &tokenIDs)
-		for _, tid := range tokenIDs {
-			wg.Add(1)
-			go func(tid string) {
-				defer wg.Done()
-				ob, _ := fetchOrderBook(tid)
-				ch <- result{tid, ob}
-			}(tid)
+		if mkt.Slug == "" {
+			continue
 		}
+		wg.Add(1)
+		go func(slug string) {
+			defer wg.Done()
+			ob, _ := fetchOrderBook(slug)
+			ch <- result{slug, ob}
+		}(mkt.Slug)
 	}
 
 	go func() {
@@ -102,14 +197,41 @@ func fetchOrderBooks(e *Event) map[string]OrderBook {
 	books := make(map[string]OrderBook)
 	for r := range ch {
 		if r.ob != nil {
-			books[r.tokenID] = *r.ob
+			books[r.slug] = *r.ob
 		}
 	}
 	return books
 }
 
+func fetchBalance() (string, error) {
+	path := "/v1/account/balances"
+	req, err := http.NewRequest("GET", AccountURL+path, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := addAuthHeaders(req, "GET", path); err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var result struct {
+		Balances []struct {
+			CurrentBalance float64 `json:"currentBalance"`
+		} `json:"balances"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || len(result.Balances) == 0 {
+		return strings.TrimSpace(string(body)), nil
+	}
+	return strconv.FormatFloat(result.Balances[0].CurrentBalance, 'f', 2, 64), nil
+}
+
 func fetchHotMarkets() ([]Event, error) {
-	resp, err := http.Get(BaseURL + "/events?active=true&closed=false&limit=20&order=volume24hr&ascending=false")
+	resp, err := http.Get(GatewayURL + "/v1/markets?active=true&closed=false&limit=20")
 	if err != nil {
 		return nil, err
 	}
@@ -118,15 +240,17 @@ func fetchHotMarkets() ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	var events []Event
-	if err := json.Unmarshal(body, &events); err != nil {
+	var result struct {
+		Markets []Market `json:"markets"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, err
 	}
-	return events, nil
+	return marketsToEvents(result.Markets), nil
 }
 
 func fetchPage(offset int) ([]Event, error) {
-	url := BaseURL + fmt.Sprintf("/events?active=true&closed=false&limit=500&offset=%d", offset)
+	url := GatewayURL + fmt.Sprintf("/v1/markets?active=true&closed=false&limit=500&offset=%d", offset)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err
@@ -136,9 +260,11 @@ func fetchPage(offset int) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	var events []Event
-	json.Unmarshal(body, &events)
-	return events, nil
+	var result struct {
+		Markets []Market `json:"markets"`
+	}
+	json.Unmarshal(body, &result)
+	return marketsToEvents(result.Markets), nil
 }
 
 func searchEvents(query string) ([]Event, error) {
@@ -147,14 +273,14 @@ func searchEvents(query string) ([]Event, error) {
 	var allEvents []Event
 	var mu sync.Mutex
 
-	for batchStart := 0; ; batchStart += 10 {
+	for batchStart := 0; ; batchStart += 50 {
 		type result struct {
 			page   int
 			events []Event
 		}
-		results := make([]result, 10)
+		results := make([]result, 50)
 		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
+		for i := 0; i < 50; i++ {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()

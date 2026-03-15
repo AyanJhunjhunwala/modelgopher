@@ -8,6 +8,7 @@ import (
 )
 
 func main() {
+	loadEnv(".env")
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

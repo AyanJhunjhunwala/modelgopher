@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -22,6 +21,7 @@ const (
 
 type eventsMsg []Event
 type tickMsg time.Time
+type balanceMsg string
 
 type refreshMsg struct {
 	event      Event
@@ -51,6 +51,8 @@ type model struct {
 	updated      time.Time
 	scrollOffset int
 	height       int
+	width        int
+	balance      string
 }
 
 func initialModel() model {
@@ -61,8 +63,15 @@ func initialModel() model {
 	return model{state: stateSearch, input: ti, height: 24}
 }
 
+func balanceCmd() tea.Cmd {
+	return func() tea.Msg {
+		bal, _ := fetchBalance()
+		return balanceMsg(bal)
+	}
+}
+
 func (m model) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, balanceCmd())
 }
 
 func fetchCmd(query string) tea.Cmd {
@@ -122,6 +131,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
+		m.width = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:
@@ -198,6 +208,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case balanceMsg:
+		m.balance = string(msg)
+		return m, nil
+
 	case tickMsg:
 		if m.state == stateView && m.selected != nil {
 			return m, refreshCmd(m.selected.ID)
@@ -210,6 +224,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// topN returns at most n order book entries (API returns best-first).
+func topN(entries []OrderEntry, n int) []OrderEntry {
+	if len(entries) <= n {
+		return entries
+	}
+	return entries[:n]
+}
+
 func sumSizes(entries []OrderEntry) float64 {
 	var total float64
 	for _, e := range entries {
@@ -217,6 +239,19 @@ func sumSizes(entries []OrderEntry) float64 {
 		total += v
 	}
 	return total
+}
+
+// headerLine right-aligns the balance badge against the window width.
+func (m model) headerLine(left string) string {
+	if m.balance == "" || m.width == 0 {
+		return left
+	}
+	badge := styleDim.Render("$" + m.balance)
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(badge) - 2
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + badge
 }
 
 func depthBar(value, max float64, width int, style lipgloss.Style) string {
@@ -238,7 +273,7 @@ func (m model) View() string {
 	case stateSearch:
 		return fmt.Sprintf(
 			"\n  %s\n\n  %s\n\n  %s\n",
-			styleTitle.Render("Polymarket CLI"),
+			m.headerLine("  "+styleTitle.Render("Polymarket US")),
 			m.input.View(),
 			styleDim.Render("enter to search • tab for hot markets • ctrl+c to quit"),
 		)
@@ -251,7 +286,7 @@ func (m model) View() string {
 			)
 		}
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("\n  %s\n\n", styleTitle.Render("Select a market")))
+		sb.WriteString("\n" + m.headerLine("  "+styleTitle.Render("Markets")) + "\n\n")
 
 		vh := m.listViewHeight()
 		end := min(m.listOffset+vh, len(m.events))
@@ -278,62 +313,100 @@ func (m model) View() string {
 		e := m.selected
 		var lines []string
 		lines = append(lines, "")
-		lines = append(lines, "  "+styleTitle.Render(e.Title))
-		lines = append(lines, fmt.Sprintf("  24h vol: $%-12.2f  liquidity: $%.2f", e.Volume24h, e.Liquidity))
+		lines = append(lines, m.headerLine("  "+styleTitle.Render(e.Title)))
 		lines = append(lines, "  "+styleDim.Render("updated "+m.updated.Format("15:04:05")))
 		lines = append(lines, "")
 
 		for _, mkt := range e.Markets {
-			var outcomes []string
-			var prices []string
-			var tokenIDs []string
-			json.Unmarshal([]byte(mkt.Outcomes), &outcomes)
-			json.Unmarshal([]byte(mkt.OutcomePrices), &prices)
-			json.Unmarshal([]byte(mkt.ClobTokenIds), &tokenIDs)
-			if len(outcomes) < 2 || len(prices) < 2 {
-				continue
-			}
-
 			if mkt.Question != "" {
 				lines = append(lines, "  "+styleDim.Render(mkt.Question))
 			}
 
-			for i, outcome := range outcomes {
-				var price float64
-				fmt.Sscanf(prices[i], "%f", &price)
-				barLen := int(price * 40)
-				if barLen < 0 {
-					barLen = 0
-				}
-				bar := strings.Repeat("█", barLen)
-				pct := fmt.Sprintf("%5.1f%%", price*100)
-				if i == 0 {
-					lines = append(lines, fmt.Sprintf("  %s %s  %s",
-						styleYesLabel.Render(fmt.Sprintf("%-4s", outcome)), pct, styleYesBar.Render(bar)))
+			// Separate long (YES) and short (NO) sides.
+			// long=true sides always carry a proper 0–1 probability.
+			// long=false sides store decimal odds, not probabilities.
+			var yesSides, noSides []MarketSide
+			for _, s := range mkt.MarketSides {
+				if s.Long {
+					yesSides = append(yesSides, s)
 				} else {
-					lines = append(lines, fmt.Sprintf("  %s %s  %s",
-						styleNoLabel.Render(fmt.Sprintf("%-4s", outcome)), pct, styleNoBar.Render(bar)))
+					noSides = append(noSides, s)
 				}
 			}
 
-			if len(tokenIDs) > 0 && m.orderBooks != nil {
-				if ob, ok := m.orderBooks[tokenIDs[0]]; ok {
-					bidTotal := sumSizes(ob.Bids)
-					askTotal := sumSizes(ob.Asks)
+			// Build display items: for a binary market (1 YES + 1 NO) show both.
+			// For multi-outcome markets show all YES sides.
+			type displayItem struct {
+				name  string
+				price float64
+				yes   bool
+			}
+			var items []displayItem
+			if len(yesSides) == 1 && len(noSides) == 1 {
+				yp, _ := strconv.ParseFloat(yesSides[0].Price, 64)
+				items = append(items, displayItem{yesSides[0].Description, yp, true})
+				items = append(items, displayItem{noSides[0].Description, 1.0 - yp, false})
+			} else {
+				for i, s := range yesSides {
+					p, _ := strconv.ParseFloat(s.Price, 64)
+					items = append(items, displayItem{s.Description, p, i == 0})
+				}
+			}
+
+			if len(items) == 0 {
+				continue
+			}
+
+			for _, item := range items {
+				barLen := int(item.price * 40)
+				if barLen < 0 {
+					barLen = 0
+				}
+				if barLen > 40 {
+					barLen = 40
+				}
+				bar := strings.Repeat("█", barLen)
+				pct := fmt.Sprintf("%5.1f%%", item.price*100)
+				label := fmt.Sprintf("%-6s", item.name)
+				if len(label) > 12 {
+					label = item.name[:12]
+				}
+				if item.yes {
+					lines = append(lines, fmt.Sprintf("  %s %s  %s",
+						styleYesLabel.Render(label), pct, styleYesBar.Render(bar)))
+				} else {
+					lines = append(lines, fmt.Sprintf("  %s %s  %s",
+						styleNoLabel.Render(label), pct, styleNoBar.Render(bar)))
+				}
+			}
+
+			if mkt.Slug != "" && m.orderBooks != nil {
+				if ob, ok := m.orderBooks[mkt.Slug]; ok {
+					// Cap to top 5 levels to avoid far-from-market orders skewing depth
+					bidTop := topN(ob.Bids, 5)
+					askTop := topN(ob.Asks, 5)
+					bidTotal := sumSizes(bidTop)
+					askTotal := sumSizes(askTop)
 					maxDepth := bidTotal
 					if askTotal > maxDepth {
 						maxDepth = askTotal
 					}
-					lines = append(lines, fmt.Sprintf("  %s $%-10.0f  %s",
-						styleBidBar.Render("BID"), bidTotal,
-						depthBar(bidTotal, maxDepth, 30, styleBidBar)))
-					lines = append(lines, fmt.Sprintf("  %s $%-10.0f  %s",
-						styleAskBar.Render("ASK"), askTotal,
-						depthBar(askTotal, maxDepth, 30, styleAskBar)))
+					bestBid, bestAsk := "", ""
+					if len(ob.Bids) > 0 {
+						bestBid = "@" + ob.Bids[0].Price
+					}
+					if len(ob.Asks) > 0 {
+						bestAsk = "@" + ob.Asks[0].Price
+					}
+					lines = append(lines, fmt.Sprintf("  %s %-8s $%-8.0f  %s",
+						styleBidBar.Render("BID"), bestBid, bidTotal,
+						depthBar(bidTotal, maxDepth, 28, styleBidBar)))
+					lines = append(lines, fmt.Sprintf("  %s %-8s $%-8.0f  %s",
+						styleAskBar.Render("ASK"), bestAsk, askTotal,
+						depthBar(askTotal, maxDepth, 28, styleAskBar)))
 				}
 			}
 
-			lines = append(lines, "  "+styleDim.Render(fmt.Sprintf("vol: $%.2f", mkt.Volume)))
 			lines = append(lines, "")
 		}
 
