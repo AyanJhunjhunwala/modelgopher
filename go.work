@@ -2,6 +2,4 @@ go 1.25.1
 
 use (
 	./modelgopher
-	./modelgopher/scalper
-	./modelgopher/greedy
 )

@@ -2,9 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,16 +25,15 @@ type balanceMsg string
 type refreshMsg struct{ event Event }
 
 var (
-	styleTitle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleCursor    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	styleYesBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	styleNoBar     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	styleYesLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	styleNoLabel   = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	styleBidBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
-	styleAskBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleBotOn     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	styleTitle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	styleCursor   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	styleYesBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	styleNoBar    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleYesLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	styleNoLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	styleBidBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	styleAskBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 type model struct {
@@ -54,7 +50,6 @@ type model struct {
 	width        int
 	balance      string
 	ws           *wsClient
-	scalpers     map[string]*os.Process // market slug → running scalper process
 }
 
 func initialModel() model {
@@ -63,10 +58,9 @@ func initialModel() model {
 	ti.Focus()
 	ti.Width = 50
 	return model{
-		state:    stateSearch,
-		input:    ti,
-		height:   24,
-		scalpers: make(map[string]*os.Process),
+		state:  stateSearch,
+		input:  ti,
+		height: 24,
 	}
 }
 
@@ -105,50 +99,6 @@ func refreshCmd(id string) tea.Cmd {
 	}
 }
 
-// binPath finds a binary by checking several locations relative to the project root.
-func binPath(relDir, name string) string {
-	home, _ := os.UserHomeDir()
-	candidates := []string{
-		// absolute path after refactor (scalper/greedy now live under modelgopher/)
-		filepath.Join(home, "Desktop", "Code", "modelgopher", "modelgopher", relDir, name),
-		// relative to the TUI binary's directory (same folder)
-		filepath.Join(".", relDir, name),
-		// one level up fallback (pre-refactor layout)
-		filepath.Join("..", relDir, name),
-	}
-	for _, p := range candidates {
-		if abs, err := filepath.Abs(p); err == nil {
-			if _, err := os.Stat(abs); err == nil {
-				return abs
-			}
-		}
-	}
-	return candidates[0]
-}
-
-func scalperBinPath() string { return binPath("scalper", "scalper_bin") }
-func greedyBinPath() string  { return binPath("greedy", "greedy_bin") }
-func manualBinPath() string  { return binPath("manual", "manual_bin") }
-
-// launchBin opens a new Terminal window running bin with slug as argument.
-func launchBin(bin, slug string) (*os.Process, error) {
-	dir := filepath.Dir(bin)
-	name := filepath.Base(bin)
-	script := fmt.Sprintf(
-		`tell application "Terminal" to do script "cd '%s' && ./%s '%s'"`,
-		dir, name, slug,
-	)
-	cmd := exec.Command("osascript", "-e", script)
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return cmd.Process, nil
-}
-
-func launchScalper(slug string) (*os.Process, error) { return launchBin(scalperBinPath(), slug) }
-func launchGreedy(slug string) (*os.Process, error)  { return launchBin(greedyBinPath(), slug) }
-func launchManual(slug string) (*os.Process, error)  { return launchBin(manualBinPath(), slug) }
-
 // listViewHeight returns the number of rows available for list items.
 func (m model) listViewHeight() int {
 	h := m.height - 4
@@ -181,9 +131,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			m.ws.close()
-			for _, p := range m.scalpers {
-				p.Kill()
-			}
 			return m, tea.Quit
 
 		case "tab":
@@ -204,51 +151,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.events = nil
 				m.cursor = 0
 				m.listOffset = 0
-			}
-			return m, nil
-
-		case "s":
-			if m.state != stateView || m.selected == nil {
-				break // let keystroke fall through to text input
-			}
-			slug := m.selected.ID
-			if proc, ok := m.scalpers[slug]; ok {
-				proc.Kill()
-				delete(m.scalpers, slug)
-			} else {
-				if proc, err := launchScalper(slug); err == nil {
-					m.scalpers[slug] = proc
-				}
-			}
-			return m, nil
-
-		case "g":
-			if m.state != stateView || m.selected == nil {
-				break
-			}
-			slug := m.selected.ID + ":greedy"
-			if proc, ok := m.scalpers[slug]; ok {
-				proc.Kill()
-				delete(m.scalpers, slug)
-			} else {
-				if proc, err := launchGreedy(m.selected.ID); err == nil {
-					m.scalpers[slug] = proc
-				}
-			}
-			return m, nil
-
-		case "m":
-			if m.state != stateView || m.selected == nil {
-				break
-			}
-			slug := m.selected.ID + ":manual"
-			if proc, ok := m.scalpers[slug]; ok {
-				proc.Kill()
-				delete(m.scalpers, slug)
-			} else {
-				if proc, err := launchManual(m.selected.ID); err == nil {
-					m.scalpers[slug] = proc
-				}
 			}
 			return m, nil
 
@@ -337,27 +239,12 @@ func topN(entries []OrderEntry, n int) []OrderEntry {
 	return entries[:n]
 }
 
-// headerLine right-aligns badges (balance, bot status) against window width.
+// headerLine right-aligns the balance badge against window width.
 func (m model) headerLine(left string) string {
-	var badges []string
-	if m.state == stateView && m.selected != nil {
-		if _, ok := m.scalpers[m.selected.ID]; ok {
-			badges = append(badges, styleBotOn.Render("[SCALPER]"))
-		}
-		if _, ok := m.scalpers[m.selected.ID+":greedy"]; ok {
-			badges = append(badges, styleBotOn.Render("[GREEDY]"))
-		}
-		if _, ok := m.scalpers[m.selected.ID+":manual"]; ok {
-			badges = append(badges, styleBotOn.Render("[MANUAL]"))
-		}
-	}
-	if m.balance != "" {
-		badges = append(badges, styleDim.Render("$"+m.balance))
-	}
-	if len(badges) == 0 || m.width == 0 {
+	if m.balance == "" || m.width == 0 {
 		return left
 	}
-	right := strings.Join(badges, "  ")
+	right := styleDim.Render("$" + m.balance)
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 1 {
 		gap = 1
@@ -402,15 +289,11 @@ func (m model) View() string {
 		end := min(m.listOffset+vh, len(m.events))
 		for i := m.listOffset; i < end; i++ {
 			e := m.events[i]
-			botTag := ""
-			if _, ok := m.scalpers[e.ID]; ok {
-				botTag = " " + styleBotOn.Render("●")
-			}
 			if i == m.cursor {
-				sb.WriteString(fmt.Sprintf("  %s %s%s\n",
-					styleCursor.Render(">"), styleCursor.Render(e.Title), botTag))
+				sb.WriteString(fmt.Sprintf("  %s %s\n",
+					styleCursor.Render(">"), styleCursor.Render(e.Title)))
 			} else {
-				sb.WriteString(fmt.Sprintf("    %s%s\n", e.Title, botTag))
+				sb.WriteString(fmt.Sprintf("    %s\n", e.Title))
 			}
 		}
 		scrollInfo := ""
@@ -535,7 +418,7 @@ func (m model) View() string {
 			lines = append(lines, "")
 		}
 
-		footer := "  " + styleDim.Render("↑/↓ scroll • s scalper • g greedy • m manual • esc back • ctrl+c quit")
+		footer := "  " + styleDim.Render("↑/↓ scroll • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
 		maxScroll := max(len(lines)-viewHeight, 0)
 		if m.scrollOffset > maxScroll {
