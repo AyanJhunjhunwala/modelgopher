@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,9 @@ var (
 	styleNoLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	styleBidBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
 	styleAskBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleOFIBuy   = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)  // green
+	styleOFISell  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)   // red
+	styleOFILog   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))  // yellow
 )
 
 type model struct {
@@ -44,6 +48,8 @@ type model struct {
 	listOffset   int
 	selected     *Event
 	orderBooks   map[string]OrderBook
+	ofiRaw       map[string]float64 // latest raw OFI per market slug
+	ofiNorm      map[string]float64 // latest normalized OFI ∈ [-1,1] per slug
 	updated      time.Time
 	scrollOffset int
 	height       int
@@ -58,9 +64,11 @@ func initialModel() model {
 	ti.Focus()
 	ti.Width = 50
 	return model{
-		state:  stateSearch,
-		input:  ti,
-		height: 24,
+		state:   stateSearch,
+		input:   ti,
+		height:  24,
+		ofiRaw:  make(map[string]float64),
+		ofiNorm: make(map[string]float64),
 	}
 }
 
@@ -131,6 +139,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			m.ws.close()
+			ofiLog.stop()
 			return m, tea.Quit
 
 		case "tab":
@@ -138,10 +147,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, hotCmd()
 			}
 
+		case "l":
+			if m.state == stateView && m.selected != nil {
+				// Toggle CSV logging for the currently viewed market.
+				// The first market slug in the event is used as the log label.
+				slug := m.selected.ID
+				if len(m.selected.Markets) > 0 && m.selected.Markets[0].Slug != "" {
+					slug = m.selected.Markets[0].Slug
+				}
+				_, _, _ = ofiLog.toggle(slug)
+			}
+
 		case "esc":
 			if m.state == stateView {
 				m.ws.close()
 				m.ws = nil
+				ofiLog.stop()
+				// Clear OFI state for all markets in this event.
+				if m.selected != nil {
+					for _, mkt := range m.selected.Markets {
+						if mkt.Slug != "" {
+							resetOFIState(mkt.Slug)
+							delete(m.ofiRaw, mkt.Slug)
+							delete(m.ofiNorm, mkt.Slug)
+						}
+					}
+				}
 				m.state = stateList
 				m.selected = nil
 				m.orderBooks = nil
@@ -201,6 +232,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.orderBooks[msg.slug] = msg.ob
 		m.updated = time.Now()
+
+		// Compute OFI and optionally log.
+		raw, norm := getOFI(msg.slug).update(msg.ob)
+		m.ofiRaw[msg.slug] = raw
+		m.ofiNorm[msg.slug] = norm
+		if ofiLog.isActive() && len(msg.ob.Bids) > 0 && len(msg.ob.Asks) > 0 {
+			bid, _ := strconv.ParseFloat(msg.ob.Bids[0].Price, 64)
+			ask, _ := strconv.ParseFloat(msg.ob.Asks[0].Price, 64)
+			ofiLog.write(msg.slug, raw, norm, bid, ask, ask-bid)
+		}
+
 		return m, wsWaitCmd(m.ws)
 
 	case wsErrMsg:
@@ -239,17 +281,39 @@ func topN(entries []OrderEntry, n int) []OrderEntry {
 	return entries[:n]
 }
 
-// headerLine right-aligns the balance badge against window width.
+// headerLine right-aligns badges (balance, log status) against window width.
 func (m model) headerLine(left string) string {
-	if m.balance == "" || m.width == 0 {
+	var parts []string
+	if ofiLog.isActive() {
+		parts = append(parts, styleOFILog.Render("[LOG]"))
+	}
+	if m.balance != "" {
+		parts = append(parts, styleDim.Render("$"+m.balance))
+	}
+	if len(parts) == 0 || m.width == 0 {
 		return left
 	}
-	right := styleDim.Render("$" + m.balance)
+	right := strings.Join(parts, "  ")
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 1 {
 		gap = 1
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// ofiBar renders a 14-char bar representing normalized OFI ∈ [-1, 1].
+// Positive = buy pressure (green), negative = sell pressure (red).
+func ofiBar(norm float64) string {
+	const width = 14
+	filled := int(math.Abs(norm) * width)
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	if norm >= 0 {
+		return styleOFIBuy.Render(bar)
+	}
+	return styleOFISell.Render(bar)
 }
 
 func depthBar(value, maxVal float64, width int, style lipgloss.Style) string {
@@ -402,6 +466,22 @@ func (m model) View() string {
 						spread := bestAsk - bestBid
 						lines = append(lines, fmt.Sprintf("  %s",
 							styleDim.Render(fmt.Sprintf("├── spread %-6.4f ────────────────", spread))))
+
+						// OFI row
+						raw := m.ofiRaw[mkt.Slug]
+						norm := m.ofiNorm[mkt.Slug]
+						label := "neutral"
+						if norm > 0.1 {
+							label = styleOFIBuy.Render("buy")
+						} else if norm < -0.1 {
+							label = styleOFISell.Render("sell")
+						} else {
+							label = styleDim.Render("neutral")
+						}
+						lines = append(lines, fmt.Sprintf("  %s  %s  %s",
+							styleDim.Render(fmt.Sprintf("├── OFI  %+8.1f", raw)),
+							ofiBar(norm),
+							label))
 					}
 
 					for _, e := range bids {
@@ -418,7 +498,7 @@ func (m model) View() string {
 			lines = append(lines, "")
 		}
 
-		footer := "  " + styleDim.Render("↑/↓ scroll • esc back • ctrl+c quit")
+		footer := "  " + styleDim.Render("↑/↓ scroll • l log • esc back • ctrl+c quit")
 		viewHeight := m.height - 1
 		maxScroll := max(len(lines)-viewHeight, 0)
 		if m.scrollOffset > maxScroll {
